@@ -1,0 +1,5 @@
+Test 1: Exploration Naïve du contenu des registres évidents.
+-> Echec. Les registres nommés sont inaccessibles.
+ptxas /tmp/tmpxft_00008d8d_00000000-6_SASS_Op_Post_test.ptx, line 80; error   : Arguments mismatch for instruction 'mov'
+ptxas /tmp/tmpxft_00008d8d_00000000-6_SASS_Op_Post_test.ptx, line 80; error   : Unknown symbol '%f16'
+ptxas fatal   : Ptx assembly aborted due to errors
