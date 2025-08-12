@@ -1,15 +1,18 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda.h>
 #include <stdio.h>
 #include <math.h>
 #include <mma.h>
 
-#define BLOCK_SIZE 16
 using namespace nvcuda;
+#define BLOCK_SIZE 16
 
 __global__ void matmul_wmma(float* C){
     __shared__ __nv_bfloat16 A[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ __nv_bfloat16 B[BLOCK_SIZE][BLOCK_SIZE];
+
+    float extracted_value = 0.0f;
 
     if (threadIdx.x < BLOCK_SIZE && threadIdx.y < BLOCK_SIZE){
         A[threadIdx.x][threadIdx.y] = (__nv_bfloat16)(threadIdx.x + threadIdx.y);
@@ -23,7 +26,8 @@ __global__ void matmul_wmma(float* C){
     wmma::load_matrix_sync(a_frag, &A[0][0], BLOCK_SIZE);
     wmma::load_matrix_sync(b_frag, &B[0][0], BLOCK_SIZE);
     wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-    asm volatile("");
+    asm volatile("mov.f32 %0, %%f16;" : "=f"(extracted_value));
+    printf("%f", extracted_value);
 }
 
 
