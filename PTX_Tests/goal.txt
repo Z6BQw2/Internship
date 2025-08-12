@@ -1,1 +1,1 @@
-.
+Step 1. Find how the registers used by mma_sync are chosen by trying different registers through [asm volatile("mov.f32 ...] in order to put register values in actual printable variables.
