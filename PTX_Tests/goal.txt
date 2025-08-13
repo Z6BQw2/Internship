@@ -5,3 +5,7 @@ First Step failed, onto step 2
 Step 2. 2 options are available. The limitation of Step 1 is that PTX forces the use of virtual registers. I can either go down to SASS to check actual registers by name, or stay with PTX and create my own mma_sync to control the register access.
 Option 1 seems the most difficult, but also the most amusing, so I'll start exploring it.
 
+My choice is done, I'll use cubin and cuobjdump -sass to get the sass of my matmul, and find how registers are stored by hand.
+
+After looking for information as to how to execute .sass, it's now clear that it's not possible as is. Option 2 therefore seems like the only option.
+
