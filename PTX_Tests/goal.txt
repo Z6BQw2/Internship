@@ -1,1 +1,7 @@
 Step 1. Find how the registers used by mma_sync are chosen by trying different registers through [asm volatile("mov.f32 ...] in order to put register values in actual printable variables.
+
+First Step failed, onto step 2
+
+Step 2. 2 options are available. The limitation of Step 1 is that PTX forces the use of virtual registers. I can either go down to SASS to check actual registers by name, or stay with PTX and create my own mma_sync to control the register access.
+Option 1 seems the most difficult, but also the most amusing, so I'll start exploring it.
+

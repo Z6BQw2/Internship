@@ -1,40 +1,21 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include <cuda.h>
 #include <stdio.h>
 #include <math.h>
 #include <mma.h>
 
-using namespace nvcuda;
 #define BLOCK_SIZE 16
+using namespace nvcuda;
 
 __global__ void matmul_wmma(float* C){
     __shared__ __nv_bfloat16 A[BLOCK_SIZE][BLOCK_SIZE];
-    //__shared__ __nv_bfloat16 B[BLOCK_SIZE][BLOCK_SIZE];
-
-    //float extracted_value = 0.0f;
+    __shared__ __nv_bfloat16 B[BLOCK_SIZE][BLOCK_SIZE];
 
     if (threadIdx.x < BLOCK_SIZE && threadIdx.y < BLOCK_SIZE){
-        A[threadIdx.x][threadIdx.y] = (__nv_bfloat16)(threadIdx.x + threadIdx.y + 1.);
-        //B[threadIdx.x][threadIdx.y] = (__nv_bfloat16)(threadIdx.x * 10 + threadIdx.y * 10);
+        A[threadIdx.x][threadIdx.y] = (__nv_bfloat16)(threadIdx.x + threadIdx.y);
+        B[threadIdx.x][threadIdx.y] = (__nv_bfloat16)(threadIdx.x * 10 + threadIdx.y * 10);
     }
 
-    if (threadIdx.x == 0 && threadIdx.y == 0) {
-        __nv_bfloat16 input_val_bf16 = A[0][0];
-        __nv_bfloat16 output_val_bf16;
-
-        unsigned short input_val_raw = *reinterpret_cast<unsigned short*>(&input_val_bf16);
-        unsigned short output_val_raw;
-
-        asm volatile("mov.b16 %0, %1;" : "=h"(output_val_raw) : "h"(input_val_raw));
-
-        output_val_bf16 = *reinterpret_cast<__nv_bfloat16*>(&output_val_raw);
-        
-        C[0] = __bfloat162float(output_val_bf16);
-        printf("[%f][%f]", (float)output_val_bf16, (float)C[0]);
-    }
-
-    /*
     wmma::fragment<wmma::matrix_a, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::col_major> b_frag;
     wmma::fragment<wmma::accumulator, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, float> acc_frag;
@@ -42,9 +23,7 @@ __global__ void matmul_wmma(float* C){
     wmma::load_matrix_sync(a_frag, &A[0][0], BLOCK_SIZE);
     wmma::load_matrix_sync(b_frag, &B[0][0], BLOCK_SIZE);
     wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-    asm volatile("mov.f32 %0, %%f16;" : "=f"(extracted_value));
-    printf("%f", extracted_value);
-    */
+    asm volatile("");
 }
 
 
@@ -66,7 +45,7 @@ int main() {
 
     float total_ms;
     cudaEventElapsedTime(&total_ms, start, end);
-    //printf("%f", total_ms);
+    printf("%f", total_ms);
 
     cudaFree(C);
     cudaEventDestroy(start);
