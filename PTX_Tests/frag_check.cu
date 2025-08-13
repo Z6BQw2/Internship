@@ -16,6 +16,12 @@ __global__ void matmul_wmma(){
     __syncthreads();
     wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
     wmma::load_matrix_sync(a_frag, &A[0][0], 16);
+    __syncthreads();
+    if(threadIdx.x == 10 && threadIdx.y == 1){
+        for(int i=0; i<8; i++){
+            printf("%f", (float)a_frag.x[i]);
+        }
+    }
 }
 
 
