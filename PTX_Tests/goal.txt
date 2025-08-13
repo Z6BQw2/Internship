@@ -9,3 +9,4 @@ My choice is done, I'll use cubin and cuobjdump -sass to get the sass of my matm
 
 After looking for information as to how to execute .sass, it's now clear that it's not possible as is. Option 2 therefore seems like the only option.
 
+After digging deeper and performing some tests, it seems the most effective method would be to implement my own driver à la asfermi to control the data-flow in-register better. That is a tremendous task, though, but it sure does seem fun. I'll go with the straight forward asm volatile approach, exploiting mma_sync in a PTX-wise fashion (aka using the PTX instruction instead of the cuda one) to impose the data-flow, and have more insight on the registers used. If this proves effective, and I achieve quantifiable results, I'll spend the rest of the internship trying the driver approach.
