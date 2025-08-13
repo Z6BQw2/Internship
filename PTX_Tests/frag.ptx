@@ -11,32 +11,221 @@
 .address_size 64
 
 	// .globl	_Z11matmul_wmmav
+.extern .func  (.param .b32 func_retval0) vprintf
+(
+	.param .b64 vprintf_param_0,
+	.param .b64 vprintf_param_1
+)
+;
 // _ZZ11matmul_wmmavE1A has been demoted
+.global .align 1 .b8 $str[3] = {37, 102};
 
 .visible .entry _Z11matmul_wmmav()
 {
-	.reg .b16 	%rs<2>;
-	.reg .b32 	%r<14>;
-	.reg .b64 	%rd<3>;
+	.local .align 8 .b8 	__local_depot0[8];
+	.reg .b64 	%SP;
+	.reg .b64 	%SPL;
+	.reg .pred 	%p<4>;
+	.reg .b16 	%rs<10>;
+	.reg .b32 	%r<34>;
+	.reg .f32 	%f<9>;
+	.reg .b64 	%rd<7>;
+	.reg .f64 	%fd<9>;
 	// demoted variable
 	.shared .align 2 .b8 _ZZ11matmul_wmmavE1A[512];
-	mov.u32 	%r2, %tid.x;
-	shl.b32 	%r3, %r2, 5;
-	mov.u32 	%r4, _ZZ11matmul_wmmavE1A;
-	add.s32 	%r5, %r4, %r3;
-	mov.u32 	%r6, %tid.y;
-	add.s32 	%r7, %r6, %r6;
-	add.s32 	%r8, %r5, %r7;
-	mad.lo.s32 	%r1, %r2, 100, %r6;
+	mov.u64 	%SPL, __local_depot0;
+	cvta.local.u64 	%SP, %SPL;
+	mov.u32 	%r6, %tid.x;
+	shl.b32 	%r7, %r6, 5;
+	mov.u32 	%r8, _ZZ11matmul_wmmavE1A;
+	add.s32 	%r9, %r8, %r7;
+	mov.u32 	%r10, %tid.y;
+	add.s32 	%r11, %r10, %r10;
+	add.s32 	%r12, %r9, %r11;
+	mad.lo.s32 	%r5, %r6, 100, %r10;
 	// begin inline asm
-	cvt.rn.bf16.u32 %rs1, %r1;
+	cvt.rn.bf16.u32 %rs1, %r5;
 	// end inline asm
-	st.shared.u16 	[%r8], %rs1;
+	st.shared.u16 	[%r12], %rs1;
 	bar.sync 	0;
-	cvt.u64.u32 	%rd1, %r4;
+	cvt.u64.u32 	%rd1, %r8;
 	cvta.shared.u64 	%rd2, %rd1;
-	mov.b32 	%r9, 16;
-	wmma.load.a.sync.aligned.row.m16n16k16.bf16 	{%r10, %r11, %r12, %r13}, [%rd2], %r9;
+	mov.b32 	%r13, 16;
+	wmma.load.a.sync.aligned.row.m16n16k16.bf16 	{%r1, %r2, %r3, %r4}, [%rd2], %r13;
+	bar.sync 	0;
+	setp.ne.s32 	%p1, %r6, 10;
+	setp.ne.s32 	%p2, %r10, 1;
+	or.pred  	%p3, %p1, %p2;
+	@%p3 bra 	$L__BB0_2;
+	add.u64 	%rd3, %SP, 0;
+	add.u64 	%rd4, %SPL, 0;
+	mov.b32 	{%rs2, %rs3}, %r1;
+	// begin inline asm
+	{ cvt.f32.bf16 %f1, %rs2;}
+
+	// end inline asm
+	cvt.f64.f32 	%fd1, %f1;
+	st.local.f64 	[%rd4], %fd1;
+	mov.u64 	%rd5, $str;
+	cvta.global.u64 	%rd6, %rd5;
+	{ // callseq 0, 0
+	.param .b64 param0;
+	st.param.b64 	[param0], %rd6;
+	.param .b64 param1;
+	st.param.b64 	[param1], %rd3;
+	.param .b32 retval0;
+	call.uni (retval0), 
+	vprintf, 
+	(
+	param0, 
+	param1
+	);
+	ld.param.b32 	%r15, [retval0];
+	} // callseq 0
+	// begin inline asm
+	{ cvt.f32.bf16 %f2, %rs3;}
+
+	// end inline asm
+	cvt.f64.f32 	%fd2, %f2;
+	st.local.f64 	[%rd4], %fd2;
+	{ // callseq 1, 0
+	.param .b64 param0;
+	st.param.b64 	[param0], %rd6;
+	.param .b64 param1;
+	st.param.b64 	[param1], %rd3;
+	.param .b32 retval0;
+	call.uni (retval0), 
+	vprintf, 
+	(
+	param0, 
+	param1
+	);
+	ld.param.b32 	%r17, [retval0];
+	} // callseq 1
+	mov.b32 	{%rs4, %rs5}, %r2;
+	// begin inline asm
+	{ cvt.f32.bf16 %f3, %rs4;}
+
+	// end inline asm
+	cvt.f64.f32 	%fd3, %f3;
+	st.local.f64 	[%rd4], %fd3;
+	{ // callseq 2, 0
+	.param .b64 param0;
+	st.param.b64 	[param0], %rd6;
+	.param .b64 param1;
+	st.param.b64 	[param1], %rd3;
+	.param .b32 retval0;
+	call.uni (retval0), 
+	vprintf, 
+	(
+	param0, 
+	param1
+	);
+	ld.param.b32 	%r20, [retval0];
+	} // callseq 2
+	// begin inline asm
+	{ cvt.f32.bf16 %f4, %rs5;}
+
+	// end inline asm
+	cvt.f64.f32 	%fd4, %f4;
+	st.local.f64 	[%rd4], %fd4;
+	{ // callseq 3, 0
+	.param .b64 param0;
+	st.param.b64 	[param0], %rd6;
+	.param .b64 param1;
+	st.param.b64 	[param1], %rd3;
+	.param .b32 retval0;
+	call.uni (retval0), 
+	vprintf, 
+	(
+	param0, 
+	param1
+	);
+	ld.param.b32 	%r22, [retval0];
+	} // callseq 3
+	mov.b32 	{%rs6, %rs7}, %r3;
+	// begin inline asm
+	{ cvt.f32.bf16 %f5, %rs6;}
+
+	// end inline asm
+	cvt.f64.f32 	%fd5, %f5;
+	st.local.f64 	[%rd4], %fd5;
+	{ // callseq 4, 0
+	.param .b64 param0;
+	st.param.b64 	[param0], %rd6;
+	.param .b64 param1;
+	st.param.b64 	[param1], %rd3;
+	.param .b32 retval0;
+	call.uni (retval0), 
+	vprintf, 
+	(
+	param0, 
+	param1
+	);
+	ld.param.b32 	%r25, [retval0];
+	} // callseq 4
+	// begin inline asm
+	{ cvt.f32.bf16 %f6, %rs7;}
+
+	// end inline asm
+	cvt.f64.f32 	%fd6, %f6;
+	st.local.f64 	[%rd4], %fd6;
+	{ // callseq 5, 0
+	.param .b64 param0;
+	st.param.b64 	[param0], %rd6;
+	.param .b64 param1;
+	st.param.b64 	[param1], %rd3;
+	.param .b32 retval0;
+	call.uni (retval0), 
+	vprintf, 
+	(
+	param0, 
+	param1
+	);
+	ld.param.b32 	%r27, [retval0];
+	} // callseq 5
+	mov.b32 	{%rs8, %rs9}, %r4;
+	// begin inline asm
+	{ cvt.f32.bf16 %f7, %rs8;}
+
+	// end inline asm
+	cvt.f64.f32 	%fd7, %f7;
+	st.local.f64 	[%rd4], %fd7;
+	{ // callseq 6, 0
+	.param .b64 param0;
+	st.param.b64 	[param0], %rd6;
+	.param .b64 param1;
+	st.param.b64 	[param1], %rd3;
+	.param .b32 retval0;
+	call.uni (retval0), 
+	vprintf, 
+	(
+	param0, 
+	param1
+	);
+	ld.param.b32 	%r30, [retval0];
+	} // callseq 6
+	// begin inline asm
+	{ cvt.f32.bf16 %f8, %rs9;}
+
+	// end inline asm
+	cvt.f64.f32 	%fd8, %f8;
+	st.local.f64 	[%rd4], %fd8;
+	{ // callseq 7, 0
+	.param .b64 param0;
+	st.param.b64 	[param0], %rd6;
+	.param .b64 param1;
+	st.param.b64 	[param1], %rd3;
+	.param .b32 retval0;
+	call.uni (retval0), 
+	vprintf, 
+	(
+	param0, 
+	param1
+	);
+	ld.param.b32 	%r32, [retval0];
+	} // callseq 7
+$L__BB0_2:
 	ret;
 
 }
