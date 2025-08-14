@@ -12,23 +12,31 @@ using namespace nvcuda;
 // Le kernel reste le même, il fait son travail de chargement et de stockage brut.
 __global__ void matmul_wmma(__half* B_out) {
     __shared__ __half A_sh[M_SIZE][M_SIZE];
+    __shared__ __half id_sh[M_SIZE][M_SIZE];
 
     unsigned int row = threadIdx.y;
     unsigned int col = threadIdx.x;
     A_sh[row][col] = __float2half((float)(row * 100 + col));
-    
+    id_sh[row][col] = __float2half((float)(row == col));
+
     __syncthreads();
 
     // On se limite au premier warp (threads 0-31)
     if (threadIdx.y < 2 && threadIdx.x < 16) {
         wmma::fragment<wmma::matrix_a, M_SIZE, M_SIZE, M_SIZE, __half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, M_SIZE, M_SIZE, M_SIZE, __half, wmma::col_major> id_frag;
+        wmma::fragment<wmma::accumulator, M_SIZE, M_SIZE, M_SIZE, float> acc_frag;
+        wmma::fill_fragment(acc_frag, 0.0f);
 
         wmma::load_matrix_sync(a_frag, &A_sh[0][0], M_SIZE);
+        wmma::load_matrix_sync(id_frag, &id_sh[0][0], M_SIZE);
+
+        wmma::mma_sync(acc_frag, a_frag, id_frag, acc_frag);
 
         unsigned int lane_id = threadIdx.x + threadIdx.y * blockDim.x;
 
         for (int i = 0; i < 8; i++) {
-            B_out[lane_id * 8 + i] = a_frag.x[i];
+            B_out[lane_id * 8 + i] = acc_frag.x[i];
         }
     }
 }
