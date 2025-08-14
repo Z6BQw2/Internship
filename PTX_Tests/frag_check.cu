@@ -35,6 +35,11 @@ __global__ void matmul_wmma(__half* B_out) {
 
         unsigned int lane_id = threadIdx.x + threadIdx.y * blockDim.x;
 
+        __half mem = (__half) 0.;
+        mem = acc_frag.x[0];
+        acc_frag.x[0] = acc_frag.x[1];
+        acc_frag.x[1] = mem; 
+
         for (int i = 0; i < 8; i++) {
             B_out[lane_id * 8 + i] = acc_frag.x[i];
         }
