@@ -1,0 +1,4 @@
+Voici mon premier jet d'une formule dictant le mappage des fragments:
+(32/(BLOCK_SIZE / 8) * (i / 2) % 2) % BLOCK_SIZE + lane % 4
+Cette formule permettra de gérer les shuffle, et savoir quel max utiliser pour chaque élément.
+
