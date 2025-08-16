@@ -30,9 +30,19 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
     float sum_A_i = 0.0f;
     float sum_B_i = 0.0f;
 
-    __shared__ __nv_bfloat16 sQ[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ __nv_bfloat16 sQ_full[BLOCK_SIZE][512];
     __shared__ __nv_bfloat16 sK[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ __nv_bfloat16 sV[BLOCK_SIZE][BLOCK_SIZE];
+
+    for(int i = 0; i < 256; i++) {
+        int flat_idx = threadIdx.x + i * 32;
+        int row = flat_idx / 512;
+        int col = flat_idx % 512;
+        if(row < 16) {
+            sQ_full[row][col] = Q[(blockIdx.y * 16 + row) * d_model + col];
+        }
+    }
+    __syncthreads();
 
     wmma::fragment<wmma::accumulator, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, float> o_frag;
     wmma::fill_fragment(o_frag, 0.0f);
@@ -47,13 +57,12 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
 
         for (int p = 0; p < d_model; p += BLOCK_SIZE) {
             for(int i = 0; i < 8; i++) {
-                sQ[(threadIdx.x * 8 + i) / 16][(threadIdx.x * 8 + i) % 16] = Q[(blockIdx.y * 16 + (threadIdx.x * 8 + i) / 16) * d_model + p + (threadIdx.x * 8 + i) % 16];
                 sK[(threadIdx.x * 8 + i) / 16][(threadIdx.x * 8 + i) % 16] = K[(j * 16 + (threadIdx.x * 8 + i) / 16) * d_model + p + (threadIdx.x * 8 + i) % 16];
             }
 
             __syncthreads();
 
-            wmma::load_matrix_sync(q_frag, &sQ[0][0], BLOCK_SIZE);
+            wmma::load_matrix_sync(q_frag, &sQ_full[0][p], 512); 
             wmma::load_matrix_sync(k_frag, &sK[0][0], BLOCK_SIZE);
             wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
 
@@ -276,7 +285,7 @@ int main() {
     cudaMemcpy(d_V, h_V, size_bf16, cudaMemcpyHostToDevice);
 
     dim3 blockDim(32, 1, 1);  // Un seul warp
-    dim3 gridDim((d_model + 15) / 16, (seq_len + 15) / 16, 1);
+    dim3 gridDim((d_model + 15) / 16, (seq_len + 15) / 16 - 1, 1);
 
     // --- WARM-UP ROUNDS ---
     printf("Performing %d warm-up rounds...\n", warmup_rounds);
@@ -332,6 +341,21 @@ int main() {
     printf("Values with error > 1e-2: %d / %d (%.2f%%)\n", 
         error_count, seq_len * d_model, 
         100.0f * error_count / (seq_len * d_model));
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    for(int i = 0; i < 100; i++) {
+        flash_attention_kernel<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    printf("Kernel time: %.3f ms\n", ms/100);
 
     free(h_Q_float); free(h_K_float); free(h_V_float);
     free(h_Q); free(h_K); free(h_V); free(h_out_1); free(h_out_2);  
