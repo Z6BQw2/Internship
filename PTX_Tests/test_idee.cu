@@ -172,6 +172,51 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
     }
 }
 
+void attention_reference(float* Q, float* K, float* V, float* out, int seq_len, int d_model) {
+    float* S = (float*)malloc(seq_len * seq_len * sizeof(float));
+    
+    // S = Q @ K^T / sqrt(d_model)
+    float scale = 1.0f / sqrtf((float)d_model);
+    for(int i = 0; i < seq_len; i++) {
+        for(int j = 0; j < seq_len; j++) {
+            float sum = 0;
+            for(int k = 0; k < d_model; k++) {
+                sum += Q[i*d_model + k] * K[j*d_model + k];
+            }
+            S[i*seq_len + j] = sum * scale;
+        }
+    }
+    
+    // Softmax par ligne
+    for(int i = 0; i < seq_len; i++) {
+        float max_val = -INFINITY;
+        for(int j = 0; j < seq_len; j++) {
+            max_val = fmaxf(max_val, S[i*seq_len + j]);
+        }
+        float sum = 0;
+        for(int j = 0; j < seq_len; j++) {
+            S[i*seq_len + j] = expf(S[i*seq_len + j] - max_val);
+            sum += S[i*seq_len + j];
+        }
+        for(int j = 0; j < seq_len; j++) {
+            S[i*seq_len + j] /= sum;
+        }
+    }
+    
+    // Out = S @ V
+    for(int i = 0; i < seq_len; i++) {
+        for(int j = 0; j < d_model; j++) {
+            float sum = 0;
+            for(int k = 0; k < seq_len; k++) {
+                sum += S[i*seq_len + k] * V[k*d_model + j];
+            }
+            out[i*d_model + j] = sum;
+        }
+    }
+    
+    free(S);
+}
+
 
 int main() {
     const int seq_len = 1024;
