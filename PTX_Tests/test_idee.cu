@@ -6,7 +6,7 @@
 
 using namespace nvcuda;
 
-#define BLOCK_SIZE 16
+#define BLOCK_SIZE 16 //Attention: 16*16 = 4*8*32 Donc Il faudra probablement cadrier la tuile par les waps, ce qui n'est pas trivial
 
 __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_bfloat16* V, __nv_bfloat16* out, 
                                int seq_len, int d_model) {
@@ -43,13 +43,13 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
     for (int j = 0; j < seq_len / BLOCK_SIZE; ++j) {
 
         wmma::fragment<wmma::matrix_a, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> q_frag;
-        wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::col_major> k_frag;
+        wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> k_frag;
         wmma::fragment<wmma::accumulator, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, float> acc_frag;
         wmma::fill_fragment(acc_frag, 0.0f);
 
         for (int p = 0; p < d_model; p += BLOCK_SIZE) {
 
-            sQ[threadIdx.y][threadIdx.x] = Q[blockIdx.y*BLOCK_SIZE+threadIdx.y * d_model + p + threadIdx.x];
+            sQ[threadIdx.y][threadIdx.x] = Q[(blockIdx.y*BLOCK_SIZE+threadIdx.y) * d_model + p + threadIdx.x];
             sK[threadIdx.y][threadIdx.x] = K[j * BLOCK_SIZE * d_model + p + threadIdx.x + threadIdx.y * d_model];
 
             __syncthreads();
@@ -121,7 +121,7 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
             p_frag.x[i] = __float2bfloat16(acc_frag.x[i] / sum_B);
         }
 
-        vals = reinterpret_cast<unsigned int*>(p_frag.x);
+        vals = reinterpret_cast<unsigned int*>(p_frag.x); //Un swap pour 2 valeurs: La reinterprétation prend 2 bits soit deux bfloat16, ce qui permet un swap en une seule instruction. Y'a pas de petites économies :)
         unsigned int temp = vals[1];
         vals[1] = vals[2];
         vals[2] = temp;
@@ -131,15 +131,15 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
         for (int p = 0; p < d_model; p += BLOCK_SIZE) {
 
             sV[threadIdx.y][threadIdx.x] = V[(j * BLOCK_SIZE + threadIdx.y) * d_model + (p + threadIdx.x)];
-            __syncthreads();
+            __syncwarp();
             
             wmma::load_matrix_sync(v_frag, &sV[0][0], BLOCK_SIZE);
             wmma::mma_sync(o_frag, p_frag, v_frag, o_frag);
             
-            __syncthreads();
+            __syncwarp();
         }
 
-        __syncthreads();
+        __syncwarp();
 
         for(int i = 0; i < 4; ++i) {
             O_accum[i] = O_accum[i] * expf(max_A_i - fmax(max_A_i, max_A)) * (sum_A_dummy / sum_A_i) + o_frag.x[i] * sum_A / sum_A_i;
