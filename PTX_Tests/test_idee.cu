@@ -41,7 +41,7 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
     for (int j = 0; j < seq_len / BLOCK_SIZE; ++j) {
 
         wmma::fragment<wmma::matrix_a, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> q_frag;
-        wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> k_frag;
+        wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::col_major> k_frag;
         wmma::fragment<wmma::accumulator, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, float> acc_frag;
         wmma::fill_fragment(acc_frag, 0.0f);
 
@@ -57,6 +57,11 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
             wmma::load_matrix_sync(k_frag, &sK[0][0], BLOCK_SIZE);
             wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
 
+            __syncthreads();
+        }
+
+        for(int i = 0; i < 8; i++) {
+            acc_frag.x[i] *= 1.0f / sqrtf((float)d_model);
         }
 
         float temp_f;
@@ -172,16 +177,17 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
     }
 }
 
-void attention_reference(float* Q, float* K, float* V, float* out, int seq_len, int d_model) {
-    float* S = (float*)malloc(seq_len * seq_len * sizeof(float));
+void attention_reference(float* Q_float, float* K_float, float* V_float, float* out_float, int seq_len, int d_model) {    
     
+    float* S = (float*)malloc(seq_len * seq_len * sizeof(float));
+
     // S = Q @ K^T / sqrt(d_model)
     float scale = 1.0f / sqrtf((float)d_model);
     for(int i = 0; i < seq_len; i++) {
         for(int j = 0; j < seq_len; j++) {
             float sum = 0;
             for(int k = 0; k < d_model; k++) {
-                sum += Q[i*d_model + k] * K[j*d_model + k];
+                sum += Q_float[i*d_model + k] * K_float[j*d_model + k];
             }
             S[i*seq_len + j] = sum * scale;
         }
@@ -208,9 +214,9 @@ void attention_reference(float* Q, float* K, float* V, float* out, int seq_len, 
         for(int j = 0; j < d_model; j++) {
             float sum = 0;
             for(int k = 0; k < seq_len; k++) {
-                sum += S[i*seq_len + k] * V[k*d_model + j];
+                sum += S[i*seq_len + k] * V_float[k*d_model + j];
             }
-            out[i*d_model + j] = sum;
+            out_float[i*d_model + j] = sum;
         }
     }
     
@@ -235,7 +241,8 @@ int main() {
     __nv_bfloat16 *h_Q = (__nv_bfloat16*)malloc(size_bf16);
     __nv_bfloat16 *h_K = (__nv_bfloat16*)malloc(size_bf16);
     __nv_bfloat16 *h_V = (__nv_bfloat16*)malloc(size_bf16);
-    __nv_bfloat16 *h_out = (__nv_bfloat16*)malloc(size_bf16);
+    __nv_bfloat16 *h_out_1 = (__nv_bfloat16*)malloc(size_bf16);
+    float *h_out_2 = (float*)malloc(seq_len * d_model * sizeof(float));
 
     srand(42);
     for (int i = 0; i < seq_len * d_model; i++) {
@@ -255,73 +262,49 @@ int main() {
     cudaMalloc(&d_V, size_bf16);
     cudaMalloc(&d_out, size_bf16);
 
-    cudaEvent_t start_total, end_total, start_kernel, end_kernel;
-    cudaEventCreate(&start_total);
-    cudaEventCreate(&end_total);
-    cudaEventCreate(&start_kernel);
-    cudaEventCreate(&end_kernel);
-
     cudaMemcpy(d_Q, h_Q, size_bf16, cudaMemcpyHostToDevice);
     cudaMemcpy(d_K, h_K, size_bf16, cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V, size_bf16, cudaMemcpyHostToDevice);
 
     dim3 blockDim(32, 1, 1);  // Un seul warp
-    dim3 gridDim((seq_len + 15) / 16, (seq_len + 15) / 16, 1);
+    dim3 gridDim((d_model + 15) / 16, (seq_len + 15) / 16, 1);
 
     // --- WARM-UP ROUNDS ---
     printf("Performing %d warm-up rounds...\n", warmup_rounds);
     for (int i = 0; i < warmup_rounds; ++i) {
         flash_attention_kernel<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
-
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            printf("CUDA Error: %s\n", cudaGetErrorString(err));
-            exit(1);
-        }
     }
 
     cudaDeviceSynchronize();
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        printf("CUDA Sync Error: %s\n", cudaGetErrorString(err));
-        exit(1);
-    }
-    printf("Warm-up complete. Performing timed execution...\n");
 
-    cudaEventRecord(start_total);
-
-    cudaEventRecord(start_kernel);
     for (int i = 0; i < run; ++i) {
         flash_attention_kernel<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            printf("CUDA Error: %s\n", cudaGetErrorString(err));
-            exit(1);
-        }
     }
-    cudaEventRecord(end_kernel);
 
-    cudaMemcpy(h_out, d_out, size_bf16, cudaMemcpyDeviceToHost);
-    
-    cudaEventRecord(end_total);
-    cudaEventSynchronize(end_total);
+    cudaMemcpy(h_out_1, d_out, size_bf16, cudaMemcpyDeviceToHost);
 
-    float total_ms, kernel_ms;
-    cudaEventElapsedTime(&total_ms, start_total, end_total);
-    cudaEventElapsedTime(&kernel_ms, start_kernel, end_kernel);
+    attention_reference(h_Q_float, h_K_float, h_V_float, h_out_2, seq_len, d_model);
 
-    printf("\n--- Results ---\n");
-    printf("Attention computed for %dx%d\n", seq_len, d_model);
-    printf("Total Time (one D2H transfer and 10 runs): %.3f ms\n", total_ms);
-    printf("Kernel Execution Time (after warm-up):    %.3f ms\n", kernel_ms / run);
+    printf("\nReference (CPU):\n");
+    for(int i=0; i<10; i++){
+        printf("%8.5f ", h_out_2[i]);
+    }
+    printf("\n\nGPU Kernel:\n");
+    for(int i=0; i<10; i++){
+        printf("%8.5f ", __bfloat162float(h_out_1[i]));
+    }
+
+    // Calcul de l'erreur
+    float max_error = 0;
+    for(int i = 0; i < seq_len * d_model; i++) {
+        float diff = fabs(h_out_2[i] - __bfloat162float(h_out_1[i]));
+        max_error = fmaxf(max_error, diff);
+    }
+    printf("\n\nMax absolute error: %e\n", max_error);
 
     free(h_Q_float); free(h_K_float); free(h_V_float);
-    free(h_Q); free(h_K); free(h_V); free(h_out);
+    free(h_Q); free(h_K); free(h_V); free(h_out_1); free(h_out_2);  
     cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_out);
-    cudaEventDestroy(start_total);
-    cudaEventDestroy(end_total);
-    cudaEventDestroy(start_kernel);
-    cudaEventDestroy(end_kernel);
 
     return 0;
 }
