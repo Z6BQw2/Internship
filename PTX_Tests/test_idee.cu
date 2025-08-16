@@ -17,7 +17,7 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
     // int globRow = by*BLOCK_SIZE+ty;
     // int globCol = bx*BLOCK_SIZE+tx;
 
-    if (blockIdx.x*BLOCK_SIZE >= seq_len || blockIdx.y*BLOCK_SIZE >= seq_len) return;
+    if (blockIdx.x*BLOCK_SIZE >= d_model || blockIdx.y*BLOCK_SIZE >= seq_len) return;
 
     float O_accum[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     unsigned int* vals;
@@ -29,8 +29,6 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
     float sum_B;
     float sum_A_i = 0.0f;
     float sum_B_i = 0.0f;
-    float sum_A_dummy = 0.0f;
-    float sum_B_dummy = 0.0f;
 
     __shared__ __nv_bfloat16 sQ[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ __nv_bfloat16 sK[BLOCK_SIZE][BLOCK_SIZE];
@@ -48,9 +46,10 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
         wmma::fill_fragment(acc_frag, 0.0f);
 
         for (int p = 0; p < d_model; p += BLOCK_SIZE) {
-
-            sQ[threadIdx.y][threadIdx.x] = Q[(blockIdx.y*BLOCK_SIZE+threadIdx.y) * d_model + p + threadIdx.x];
-            sK[threadIdx.y][threadIdx.x] = K[j * BLOCK_SIZE * d_model + p + threadIdx.x + threadIdx.y * d_model];
+            for(int i = 0; i < 8; i++) {
+                sQ[(threadIdx.x * 8 + i) / 16][(threadIdx.x * 8 + i) % 16] = Q[(blockIdx.y * 16 + (threadIdx.x * 8 + i) / 16) * d_model + p + (threadIdx.x * 8 + i) % 16];
+                sK[(threadIdx.x * 8 + i) / 16][(threadIdx.x * 8 + i) % 16] = K[(j * 16 + (threadIdx.x * 8 + i) / 16) * d_model + p + (threadIdx.x * 8 + i) % 16];
+            }
 
             __syncthreads();
 
@@ -109,8 +108,11 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
         sum_A += partner_max_A;
         sum_B += partner_max_B; 
 
-        sum_A_i = sum_A_i * expf(max_A_i - fmax(max_A_i, max_A)) + sum_A * expf(max_A - max(max_A_i, max_A));
-        sum_B_i = sum_B_i * expf(max_B_i - fmax(max_B_i, max_B)) + sum_B * expf(max_B - max(max_B_i, max_B));
+        float old_sum_A_i = sum_A_i;
+        float old_sum_B_i = sum_B_i;
+
+        sum_A_i = old_sum_A_i * expf(max_A_i - fmax(max_A_i, max_A)) + sum_A * expf(max_A - fmax(max_A_i, max_A));
+        sum_B_i = old_sum_B_i * expf(max_B_i - fmax(max_B_i, max_B)) + sum_B * expf(max_B - fmax(max_B_i, max_B));
 
         wmma::fragment<wmma::matrix_a, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> p_frag;
 
@@ -127,60 +129,86 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
         vals[2] = temp;
 
         wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> v_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> pv_frag;
+        wmma::fill_fragment(pv_frag, 0.0f);
 
         for (int p = 0; p < d_model; p += BLOCK_SIZE) {
-
-            sV[threadIdx.y][threadIdx.x] = V[(j * BLOCK_SIZE + threadIdx.y) * d_model + (p + threadIdx.x)];
-            __syncwarp();
+            for(int i = 0; i < 8; i++) {
+                int elem_idx = threadIdx.x * 8 + i;
+                int row = elem_idx / 16;
+                int col = elem_idx % 16;
+                sV[row][col] = V[(j * 16 + row) * d_model + p + col];
+            }
+            __syncthreads();
             
-            wmma::load_matrix_sync(v_frag, &sV[0][0], BLOCK_SIZE);
-            wmma::mma_sync(o_frag, p_frag, v_frag, o_frag);
-            
-            __syncwarp();
+            wmma::load_matrix_sync(v_frag, &sV[0][0], 16);
+            wmma::mma_sync(pv_frag, p_frag, v_frag, pv_frag);  // Accumule dans pv_frag
         }
-
-        __syncwarp();
 
         for(int i = 0; i < 4; ++i) {
-            O_accum[i] = O_accum[i] * expf(max_A_i - fmax(max_A_i, max_A)) * (sum_A_dummy / sum_A_i) + o_frag.x[i] * sum_A / sum_A_i;
+            O_accum[i] = O_accum[i] * (old_sum_A_i / sum_A_i) * expf(max_A_i - fmax(max_A_i, max_A)) + pv_frag.x[i] * (sum_A / sum_A_i);
         }
+
         for(int i = 4; i < 8; ++i) {
-            O_accum[i] = O_accum[i] * expf(max_B_i - fmax(max_B_i, max_B)) * (sum_B_dummy / sum_B_i) + o_frag.x[i] * sum_B / sum_B_i;
+            O_accum[i] = O_accum[i] * (old_sum_B_i / sum_B_i) * expf(max_B_i - fmax(max_B_i, max_B)) + pv_frag.x[i] * (sum_B / sum_B_i);
         }
 
         max_A_i = fmax(max_A_i, max_A);
         max_B_i = fmax(max_B_i, max_B);
     }
 
-    // out[(blockIdx.y * BLOCK_SIZE + threadIdx.y) * d_model + blockIdx.x * BLOCK_SIZE + threadIdx.x] = O_accum; à adapter pour les saleté de patternes de frag
+    float temp_f = O_accum[2];
+    O_accum[2] = O_accum[4];
+    O_accum[4] = temp_f;
+
+    temp_f = O_accum[3];
+    O_accum[3] = O_accum[5];
+    O_accum[5] = temp_f;
+
+    // Écriture avec les formules de mapping inverse
+    for(int i = 0; i < 8; i++) {
+
+        out[(blockIdx.y * 16 + (threadIdx.x / 4) + (((i >> 1) & 1) * 8)) * d_model + blockIdx.x * 16 + ((threadIdx.x % 4) * 2) + (i % 2) + (((i >> 2) & 1) * 8)] = __float2bfloat16(O_accum[i]);
+    }
 }
 
 
 int main() {
     const int seq_len = 1024;
     const int d_model = 512;
-    const int size = seq_len * d_model * sizeof(float);
+    const int size_bf16 = seq_len * d_model * sizeof(__nv_bfloat16);
     const int warmup_rounds = 20;
     const int run = 10;
+    cudaError_t err;
 
-    float *h_Q, *h_K, *h_V, *h_out;
-    h_Q = (float*)malloc(size);
-    h_K = (float*)malloc(size);
-    h_V = (float*)malloc(size);
-    h_out = (float*)malloc(size);
+    // Host arrays en float pour l'initialisation
+    float *h_Q_float = (float*)malloc(seq_len * d_model * sizeof(float));
+    float *h_K_float = (float*)malloc(seq_len * d_model * sizeof(float));
+    float *h_V_float = (float*)malloc(seq_len * d_model * sizeof(float));
+    
+    // Host arrays en bfloat16
+    __nv_bfloat16 *h_Q = (__nv_bfloat16*)malloc(size_bf16);
+    __nv_bfloat16 *h_K = (__nv_bfloat16*)malloc(size_bf16);
+    __nv_bfloat16 *h_V = (__nv_bfloat16*)malloc(size_bf16);
+    __nv_bfloat16 *h_out = (__nv_bfloat16*)malloc(size_bf16);
 
-    srand(42); // Use a fixed seed for reproducibility
+    srand(42);
     for (int i = 0; i < seq_len * d_model; i++) {
-        h_Q[i] = ((float)rand()/RAND_MAX) - 0.5f;
-        h_K[i] = ((float)rand()/RAND_MAX) - 0.5f;
-        h_V[i] = ((float)rand()/RAND_MAX) - 0.5f;
+        h_Q_float[i] = ((float)rand()/RAND_MAX) - 0.5f;
+        h_K_float[i] = ((float)rand()/RAND_MAX) - 0.5f;
+        h_V_float[i] = ((float)rand()/RAND_MAX) - 0.5f;
+        
+        // Conversion float -> bfloat16
+        h_Q[i] = __float2bfloat16(h_Q_float[i]);
+        h_K[i] = __float2bfloat16(h_K_float[i]);
+        h_V[i] = __float2bfloat16(h_V_float[i]);
     }
 
-    float *d_Q, *d_K, *d_V, *d_out;
-    cudaMalloc(&d_Q, size);
-    cudaMalloc(&d_K, size);
-    cudaMalloc(&d_V, size);
-    cudaMalloc(&d_out, size);
+    __nv_bfloat16 *d_Q, *d_K, *d_V, *d_out;
+    cudaMalloc(&d_Q, size_bf16);
+    cudaMalloc(&d_K, size_bf16);
+    cudaMalloc(&d_V, size_bf16);
+    cudaMalloc(&d_out, size_bf16);
 
     cudaEvent_t start_total, end_total, start_kernel, end_kernel;
     cudaEventCreate(&start_total);
@@ -188,31 +216,47 @@ int main() {
     cudaEventCreate(&start_kernel);
     cudaEventCreate(&end_kernel);
 
-    cudaMemcpy(d_Q, h_Q, size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, h_K, size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, h_V, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_Q, h_Q, size_bf16, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, h_K, size_bf16, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, h_V, size_bf16, cudaMemcpyHostToDevice);
 
-    dim3 blockSize(32, 32);
-    dim3 gridSize(d_model/32, seq_len/32);
+    dim3 blockDim(32, 1, 1);  // Un seul warp
+    dim3 gridDim((seq_len + 15) / 16, (seq_len + 15) / 16, 1);
 
     // --- WARM-UP ROUNDS ---
     printf("Performing %d warm-up rounds...\n", warmup_rounds);
     for (int i = 0; i < warmup_rounds; ++i) {
-        flash_attention_kernel<<<gridSize, blockSize>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
+        flash_attention_kernel<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
+
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("CUDA Error: %s\n", cudaGetErrorString(err));
+            exit(1);
+        }
     }
 
     cudaDeviceSynchronize();
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("CUDA Sync Error: %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
     printf("Warm-up complete. Performing timed execution...\n");
 
     cudaEventRecord(start_total);
 
     cudaEventRecord(start_kernel);
     for (int i = 0; i < run; ++i) {
-        flash_attention_kernel<<<gridSize, blockSize>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
+        flash_attention_kernel<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("CUDA Error: %s\n", cudaGetErrorString(err));
+            exit(1);
+        }
     }
     cudaEventRecord(end_kernel);
 
-    cudaMemcpy(h_out, d_out, size, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_out, d_out, size_bf16, cudaMemcpyDeviceToHost);
     
     cudaEventRecord(end_total);
     cudaEventSynchronize(end_total);
@@ -221,12 +265,12 @@ int main() {
     cudaEventElapsedTime(&total_ms, start_total, end_total);
     cudaEventElapsedTime(&kernel_ms, start_kernel, end_kernel);
 
-    // Print results
     printf("\n--- Results ---\n");
     printf("Attention computed for %dx%d\n", seq_len, d_model);
     printf("Total Time (one D2H transfer and 10 runs): %.3f ms\n", total_ms);
     printf("Kernel Execution Time (after warm-up):    %.3f ms\n", kernel_ms / run);
 
+    free(h_Q_float); free(h_K_float); free(h_V_float);
     free(h_Q); free(h_K); free(h_V); free(h_out);
     cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_out);
     cudaEventDestroy(start_total);
