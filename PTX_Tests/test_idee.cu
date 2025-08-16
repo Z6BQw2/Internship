@@ -6,7 +6,7 @@
 
 using namespace nvcuda;
 
-#define BLOCK_SIZE 16 //Attention: 16*16 = 4*8*32 Donc Il faudra probablement cadrier la tuile par les waps, ce qui n'est pas trivial
+#define BLOCK_SIZE 16
 
 __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_bfloat16* V, __nv_bfloat16* out, 
                                int seq_len, int d_model) {
@@ -30,6 +30,7 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
     float sum_A_i = 0.0f;
     float sum_B_i = 0.0f;
 
+    #define PADDED_D (512 + 8)
     __shared__ __nv_bfloat16 sQ_full[BLOCK_SIZE][512];
     __shared__ __nv_bfloat16 sK[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ __nv_bfloat16 sV[BLOCK_SIZE][BLOCK_SIZE];
@@ -57,12 +58,27 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
 
         for (int p = 0; p < d_model; p += BLOCK_SIZE) {
             for(int i = 0; i < 8; i++) {
-                sK[(threadIdx.x * 8 + i) / 16][(threadIdx.x * 8 + i) % 16] = K[(j * 16 + (threadIdx.x * 8 + i) / 16) * d_model + p + (threadIdx.x * 8 + i) % 16];
+                int tile_idx = threadIdx.x + i * 32; // thread 0 charge les éléments 0, 32, 64...
+                                                    // thread 1 charge les éléments 1, 33, 65...
+                int row_in_tile = tile_idx / BLOCK_SIZE;
+                int col_in_tile = tile_idx % BLOCK_SIZE;
+
+                int global_K_row = j * BLOCK_SIZE + row_in_tile;
+                int global_K_col = p + col_in_tile;
+                
+                // L'accès à K est maintenant K[... + global_K_col].
+                // Pour i=0, les threads 0,1,2... accèdent à K[... + p], K[... + p+1], K[... + p+2]
+                // C'est COALESCÉ.
+                if (global_K_row < seq_len && global_K_col < d_model) {
+                    sK[row_in_tile][col_in_tile] = K[global_K_row * d_model + global_K_col];
+                } else {
+                    sK[row_in_tile][col_in_tile] = __float2bfloat16(0.0f);
+                }
             }
 
             __syncthreads();
 
-            wmma::load_matrix_sync(q_frag, &sQ_full[0][p], 512); 
+            wmma::load_matrix_sync(q_frag, &sQ_full[0][p], PADDED_D); 
             wmma::load_matrix_sync(k_frag, &sK[0][0], BLOCK_SIZE);
             wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
 
@@ -148,12 +164,19 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
 
         // PAS de boucle sur p ici !
         for(int i = 0; i < 8; i++) {
-            int elem_idx = threadIdx.x * 8 + i;
-            int row = elem_idx / 16;
-            int col = elem_idx % 16;
-            sV[row][col] = V[(j * 16 + row) * d_model + blockIdx.x * 16 + col];
-            //                                            ^^^^^^^^^^^^^^
-            //                               Seulement les colonnes du bloc actuel
+            int tile_idx = threadIdx.x + i * 32;
+            int row_in_tile = tile_idx / BLOCK_SIZE;
+            int col_in_tile = tile_idx % BLOCK_SIZE;
+
+            int global_V_row = j * BLOCK_SIZE + row_in_tile;
+            // Les colonnes de V dont on a besoin sont celles qui correspondent au bloc de sortie 'O'
+            int global_V_col = blockIdx.x * BLOCK_SIZE + col_in_tile;
+
+            if (global_V_row < seq_len && global_V_col < d_model) {
+                sV[row_in_tile][col_in_tile] = V[global_V_row * d_model + global_V_col];
+            } else {
+                sV[row_in_tile][col_in_tile] = __float2bfloat16(0.0f);
+            }
         }
         __syncthreads();
 
@@ -285,7 +308,7 @@ int main() {
     cudaMemcpy(d_V, h_V, size_bf16, cudaMemcpyHostToDevice);
 
     dim3 blockDim(32, 1, 1);  // Un seul warp
-    dim3 gridDim((d_model + 15) / 16, (seq_len + 15) / 16 - 1, 1);
+    dim3 gridDim((d_model + 15) / 16, (seq_len + 15) / 16, 1);
 
     // --- WARM-UP ROUNDS ---
     printf("Performing %d warm-up rounds...\n", warmup_rounds);
