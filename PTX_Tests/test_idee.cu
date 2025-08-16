@@ -7,6 +7,7 @@
 using namespace nvcuda;
 
 #define BLOCK_SIZE 16
+#define PADDED_D (512 + 8)
 
 __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_bfloat16* V, __nv_bfloat16* out, 
                                int seq_len, int d_model) {
@@ -30,8 +31,7 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
     float sum_A_i = 0.0f;
     float sum_B_i = 0.0f;
 
-    #define PADDED_D (512 + 8)
-    __shared__ __nv_bfloat16 sQ_full[BLOCK_SIZE][512];
+    __shared__ __nv_bfloat16 sQ_full[BLOCK_SIZE][PADDED_D];
     __shared__ __nv_bfloat16 sK[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ __nv_bfloat16 sV[BLOCK_SIZE][BLOCK_SIZE];
 
@@ -58,17 +58,13 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
 
         for (int p = 0; p < d_model; p += BLOCK_SIZE) {
             for(int i = 0; i < 8; i++) {
-                int tile_idx = threadIdx.x + i * 32; // thread 0 charge les éléments 0, 32, 64...
-                                                    // thread 1 charge les éléments 1, 33, 65...
+                int tile_idx = threadIdx.x + i * 32;
                 int row_in_tile = tile_idx / BLOCK_SIZE;
                 int col_in_tile = tile_idx % BLOCK_SIZE;
 
                 int global_K_row = j * BLOCK_SIZE + row_in_tile;
                 int global_K_col = p + col_in_tile;
                 
-                // L'accès à K est maintenant K[... + global_K_col].
-                // Pour i=0, les threads 0,1,2... accèdent à K[... + p], K[... + p+1], K[... + p+2]
-                // C'est COALESCÉ.
                 if (global_K_row < seq_len && global_K_col < d_model) {
                     sK[row_in_tile][col_in_tile] = K[global_K_row * d_model + global_K_col];
                 } else {
@@ -82,7 +78,6 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
             wmma::load_matrix_sync(k_frag, &sK[0][0], BLOCK_SIZE);
             wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
 
-            __syncthreads();
         }
 
         for(int i = 0; i < 8; i++) {
