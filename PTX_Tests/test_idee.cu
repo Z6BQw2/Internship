@@ -137,18 +137,27 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
         wmma::fragment<wmma::accumulator, 16, 16, 16, float> pv_frag;
         wmma::fill_fragment(pv_frag, 0.0f);
 
-        for (int p = 0; p < d_model; p += BLOCK_SIZE) {
-            for(int i = 0; i < 8; i++) {
-                int elem_idx = threadIdx.x * 8 + i;
-                int row = elem_idx / 16;
-                int col = elem_idx % 16;
-                sV[row][col] = V[(j * 16 + row) * d_model + p + col];
-            }
-            __syncthreads();
-            
-            wmma::load_matrix_sync(v_frag, &sV[0][0], 16);
-            wmma::mma_sync(pv_frag, p_frag, v_frag, pv_frag);  // Accumule dans pv_frag
+        // PAS de boucle sur p ici !
+        for(int i = 0; i < 8; i++) {
+            int elem_idx = threadIdx.x * 8 + i;
+            int row = elem_idx / 16;
+            int col = elem_idx % 16;
+            sV[row][col] = V[(j * 16 + row) * d_model + blockIdx.x * 16 + col];
+            //                                            ^^^^^^^^^^^^^^
+            //                               Seulement les colonnes du bloc actuel
         }
+        __syncthreads();
+
+        wmma::load_matrix_sync(v_frag, &sV[0][0], 16);
+        wmma::mma_sync(pv_frag, p_frag, v_frag, pv_frag);
+
+        temp_f = pv_frag.x[2];
+        pv_frag.x[2] = pv_frag.x[4];
+        pv_frag.x[4] = temp_f;
+
+        temp_f = pv_frag.x[3];
+        pv_frag.x[3] = pv_frag.x[5];
+        pv_frag.x[5] = temp_f;
 
         for(int i = 0; i < 4; ++i) {
             O_accum[i] = O_accum[i] * (old_sum_A_i / sum_A_i) * expf(max_A_i - fmax(max_A_i, max_A)) + pv_frag.x[i] * (sum_A / sum_A_i);
@@ -294,13 +303,35 @@ int main() {
         printf("%8.5f ", __bfloat162float(h_out_1[i]));
     }
 
-    // Calcul de l'erreur
+    // Calcul de l'erreur sur TOUTE la matrice
     float max_error = 0;
+    float sum_error = 0;
+    float sum_squared_error = 0;
+    int error_count = 0;
+
     for(int i = 0; i < seq_len * d_model; i++) {
-        float diff = fabs(h_out_2[i] - __bfloat162float(h_out_1[i]));
+        float gpu_val = __bfloat162float(h_out_1[i]);
+        float ref_val = h_out_2[i];
+        float diff = fabs(ref_val - gpu_val);
+        
         max_error = fmaxf(max_error, diff);
+        sum_error += diff;
+        sum_squared_error += diff * diff;
+        
+        // Compte les erreurs > seuil
+        if(diff > 1e-2) error_count++;
     }
-    printf("\n\nMax absolute error: %e\n", max_error);
+
+    float mean_error = sum_error / (seq_len * d_model);
+    float rms_error = sqrtf(sum_squared_error / (seq_len * d_model));
+
+    printf("\n=== Error Analysis ===\n");
+    printf("Max absolute error: %e\n", max_error);
+    printf("Mean absolute error: %e\n", mean_error);
+    printf("RMS error: %e\n", rms_error);
+    printf("Values with error > 1e-2: %d / %d (%.2f%%)\n", 
+        error_count, seq_len * d_model, 
+        100.0f * error_count / (seq_len * d_model));
 
     free(h_Q_float); free(h_K_float); free(h_V_float);
     free(h_Q); free(h_K); free(h_V); free(h_out_1); free(h_out_2);  
