@@ -53,8 +53,8 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
 
         wmma::fragment<wmma::matrix_a, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> q_frag;
         wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::col_major> k_frag;
-        wmma::fragment<wmma::accumulator, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, float> acc_frag;
-        wmma::fill_fragment(acc_frag, 0.0f);
+        wmma::fragment<wmma::accumulator, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, float> work_frag;
+        wmma::fill_fragment(work_frag, 0.0f);
 
         for (int p = 0; p < d_model; p += BLOCK_SIZE) {
             for(int i = 0; i < 8; i++) {
@@ -76,27 +76,27 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
 
             wmma::load_matrix_sync(q_frag, &sQ_full[0][p], PADDED_D); 
             wmma::load_matrix_sync(k_frag, &sK[0][0], BLOCK_SIZE);
-            wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
+            wmma::mma_sync(work_frag, q_frag, k_frag, work_frag);
 
         }
 
         for(int i = 0; i < 8; i++) {
-            acc_frag.x[i] *= 1.0f / sqrtf((float)d_model);
+            work_frag.x[i] *= 1.0f / sqrtf((float)d_model);
         }
 
         float temp_f;
 
         // Échange le bloc {x[2], x[3]} avec le bloc {x[4], x[5]}
-        temp_f = acc_frag.x[2];
-        acc_frag.x[2] = acc_frag.x[4];
-        acc_frag.x[4] = temp_f;
+        temp_f = work_frag.x[2];
+        work_frag.x[2] = work_frag.x[4];
+        work_frag.x[4] = temp_f;
 
-        temp_f = acc_frag.x[3];
-        acc_frag.x[3] = acc_frag.x[5];
-        acc_frag.x[5] = temp_f;
+        temp_f = work_frag.x[3];
+        work_frag.x[3] = work_frag.x[5];
+        work_frag.x[5] = temp_f;
         
-        max_A = fmaxf(fmaxf(acc_frag.x[0], acc_frag.x[1]), fmaxf(acc_frag.x[2], acc_frag.x[3]));
-        max_B = fmaxf(fmaxf(acc_frag.x[4], acc_frag.x[5]), fmaxf(acc_frag.x[6], acc_frag.x[7]));
+        max_A = fmaxf(fmaxf(work_frag.x[0], work_frag.x[1]), fmaxf(work_frag.x[2], work_frag.x[3]));
+        max_B = fmaxf(fmaxf(work_frag.x[4], work_frag.x[5]), fmaxf(work_frag.x[6], work_frag.x[7]));
 
         float partner_max_A = __shfl_xor_sync(0xF << ((threadIdx.x / 4) * 4), max_A, 1);
         float partner_max_B = __shfl_xor_sync(0xF << ((threadIdx.x / 4) * 4), max_B, 1);
@@ -113,12 +113,12 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
         sum_A = 0.0f;
         sum_B = 0.0f;
         for(int i = 0; i < 4; ++i) {
-            acc_frag.x[i] = expf(acc_frag.x[i] - max_A);
-            sum_A += acc_frag.x[i];
+            work_frag.x[i] = expf(work_frag.x[i] - max_A);
+            sum_A += work_frag.x[i];
         }
         for(int i = 4; i < 8; ++i) {
-            acc_frag.x[i] = expf(acc_frag.x[i] - max_B);
-            sum_B += acc_frag.x[i];
+            work_frag.x[i] = expf(work_frag.x[i] - max_B);
+            sum_B += work_frag.x[i];
         }
 
         partner_max_A = __shfl_xor_sync(0xF << ((threadIdx.x / 4) * 4), sum_A, 1);
@@ -142,10 +142,10 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
         wmma::fragment<wmma::matrix_a, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> p_frag;
 
         for(int i = 0; i < 4; ++i) {
-            p_frag.x[i] = __float2bfloat16(acc_frag.x[i] / sum_A);
+            p_frag.x[i] = __float2bfloat16(work_frag.x[i] / sum_A);
         }
         for(int i = 4; i < 8; ++i) {
-            p_frag.x[i] = __float2bfloat16(acc_frag.x[i] / sum_B);
+            p_frag.x[i] = __float2bfloat16(work_frag.x[i] / sum_B);
         }
 
         vals = reinterpret_cast<unsigned int*>(p_frag.x); //Un swap pour 2 valeurs: La reinterprétation prend 2 bits soit deux bfloat16, ce qui permet un swap en une seule instruction. Y'a pas de petites économies :)
@@ -154,17 +154,15 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
         vals[2] = temp;
 
         wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> v_frag;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> pv_frag;
-        wmma::fill_fragment(pv_frag, 0.0f);
+        wmma::fill_fragment(work_frag, 0.0f);
 
-        // PAS de boucle sur p ici !
         for(int i = 0; i < 8; i++) {
             int tile_idx = threadIdx.x + i * 32;
             int row_in_tile = tile_idx / BLOCK_SIZE;
             int col_in_tile = tile_idx % BLOCK_SIZE;
 
             int global_V_row = j * BLOCK_SIZE + row_in_tile;
-            // Les colonnes de V dont on a besoin sont celles qui correspondent au bloc de sortie 'O'
+
             int global_V_col = blockIdx.x * BLOCK_SIZE + col_in_tile;
 
             if (global_V_row < seq_len && global_V_col < d_model) {
@@ -176,22 +174,22 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
         __syncthreads();
 
         wmma::load_matrix_sync(v_frag, &sV[0][0], 16);
-        wmma::mma_sync(pv_frag, p_frag, v_frag, pv_frag);
+        wmma::mma_sync(work_frag, p_frag, v_frag, work_frag);
 
-        temp_f = pv_frag.x[2];
-        pv_frag.x[2] = pv_frag.x[4];
-        pv_frag.x[4] = temp_f;
+        temp_f = work_frag.x[2];
+        work_frag.x[2] = work_frag.x[4];
+        work_frag.x[4] = temp_f;
 
-        temp_f = pv_frag.x[3];
-        pv_frag.x[3] = pv_frag.x[5];
-        pv_frag.x[5] = temp_f;
+        temp_f = work_frag.x[3];
+        work_frag.x[3] = work_frag.x[5];
+        work_frag.x[5] = temp_f;
 
         for(int i = 0; i < 4; ++i) {
-            O_accum[i] = O_accum[i] * (old_sum_A_i / sum_A_i) * expf(max_A_i - fmax(max_A_i, max_A)) + pv_frag.x[i] * (sum_A / sum_A_i);
+            O_accum[i] = O_accum[i] * (old_sum_A_i / sum_A_i) * expf(max_A_i - fmax(max_A_i, max_A)) + work_frag.x[i] * (sum_A / sum_A_i);
         }
 
         for(int i = 4; i < 8; ++i) {
-            O_accum[i] = O_accum[i] * (old_sum_B_i / sum_B_i) * expf(max_B_i - fmax(max_B_i, max_B)) + pv_frag.x[i] * (sum_B / sum_B_i);
+            O_accum[i] = O_accum[i] * (old_sum_B_i / sum_B_i) * expf(max_B_i - fmax(max_B_i, max_B)) + work_frag.x[i] * (sum_B / sum_B_i);
         }
 
         max_A_i = fmax(max_A_i, max_A);
