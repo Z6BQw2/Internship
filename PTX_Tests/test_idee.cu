@@ -19,8 +19,6 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
     // int globCol = bx*BLOCK_SIZE+tx;
 
     if (blockIdx.x*BLOCK_SIZE >= d_model || blockIdx.y*BLOCK_SIZE >= seq_len) return;
-
-    float O_accum[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     unsigned int* vals;
     float max_A;
     float max_B;
@@ -32,8 +30,12 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
     float sum_B_i = 0.0f;
 
     __shared__ __nv_bfloat16 sQ_full[BLOCK_SIZE][PADDED_D];
-    __shared__ __nv_bfloat16 sK[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ __nv_bfloat16 sK[2][BLOCK_SIZE][BLOCK_SIZE];
     __shared__ __nv_bfloat16 sV[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float s_O_accum[32][8];
+
+    __nv_bfloat16 (*sK_current)[BLOCK_SIZE] = sK[0];
+    __nv_bfloat16 (*sK_next)[BLOCK_SIZE]    = sK[1];
 
     for(int i = 0; i < 256; i++) {
         int flat_idx = threadIdx.x + i * 32;
@@ -43,11 +45,11 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
             sQ_full[row][col] = Q[(blockIdx.y * 16 + row) * d_model + col];
         }
     }
-    __syncthreads();
 
-    wmma::fragment<wmma::accumulator, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, float> o_frag;
-    wmma::fill_fragment(o_frag, 0.0f);
-    
+    for(int i = 0; i < 8; i++) {
+        s_O_accum[threadIdx.x][i] = 0.0f;
+    }
+
     // BOUCLE FLASH (externe) - Itère sur les blocs de K/V
     for (int j = 0; j < seq_len / BLOCK_SIZE; ++j) {
 
@@ -56,30 +58,51 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
         wmma::fragment<wmma::accumulator, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, float> work_frag;
         wmma::fill_fragment(work_frag, 0.0f);
 
-        for (int p = 0; p < d_model; p += BLOCK_SIZE) {
+        // A. PROLOGUE: Remplir le premier buffer (sK[0]).
+        for(int i = 0; i < 8; i++) {
+            // ... (logique de calcul d'index inchangée)
+            int tile_idx = threadIdx.x + i * 32;
+            int row_in_tile = tile_idx / BLOCK_SIZE;
+            int col_in_tile = tile_idx % BLOCK_SIZE;
+            int global_K_row = j * BLOCK_SIZE + row_in_tile;
+            int global_K_col = 0 + col_in_tile;
+            sK[0][row_in_tile][col_in_tile] = K[global_K_row * d_model + global_K_col];
+        }
+
+        // B. BOUCLE PRINCIPALE: Le pipeline.
+        for (int p = 0; p < d_model / BLOCK_SIZE - 1; ++p) {
+            __syncthreads();
+            // Choisit quel buffer est le 'current' et quel est le 'next' pour CETTE itération
+            int current_buf_idx = p % 2;
+            int next_buf_idx = 1 - current_buf_idx;
+
+            // 1. Pré-charger la PROCHAINE tuile K (p+1) dans le buffer "next".
             for(int i = 0; i < 8; i++) {
+                // ... (logique de calcul d'index inchangée)
                 int tile_idx = threadIdx.x + i * 32;
                 int row_in_tile = tile_idx / BLOCK_SIZE;
                 int col_in_tile = tile_idx % BLOCK_SIZE;
-
                 int global_K_row = j * BLOCK_SIZE + row_in_tile;
-                int global_K_col = p + col_in_tile;
-                
-                if (global_K_row < seq_len && global_K_col < d_model) {
-                    sK[row_in_tile][col_in_tile] = K[global_K_row * d_model + global_K_col];
-                } else {
-                    sK[row_in_tile][col_in_tile] = __float2bfloat16(0.0f);
-                }
+                int global_K_col = (p + 1) * BLOCK_SIZE + col_in_tile;
+                sK[next_buf_idx][row_in_tile][col_in_tile] = K[global_K_row * d_model + global_K_col];
             }
 
-            __syncthreads();
-
-            wmma::load_matrix_sync(q_frag, &sQ_full[0][p], PADDED_D); 
-            wmma::load_matrix_sync(k_frag, &sK[0][0], BLOCK_SIZE);
+            // 2. Calculer avec la tuile ACTUELLE (p), qui est déjà dans le buffer "current".
+            wmma::load_matrix_sync(q_frag, &sQ_full[0][p * BLOCK_SIZE], PADDED_D);
+            wmma::load_matrix_sync(k_frag, &sK[current_buf_idx][0][0], BLOCK_SIZE);
             wmma::mma_sync(work_frag, q_frag, k_frag, work_frag);
 
         }
 
+        // C. EPILOGUE: Calculer la TOUTE DERNIERE tuile.
+        // On doit déterminer dans quel buffer elle a été chargée en dernier.
+        int last_buf_idx = (d_model / BLOCK_SIZE - 1) % 2;
+        wmma::load_matrix_sync(q_frag, &sQ_full[0][(d_model / BLOCK_SIZE - 1) * BLOCK_SIZE], PADDED_D);
+        wmma::load_matrix_sync(k_frag, &sK[last_buf_idx][0][0], BLOCK_SIZE);
+        wmma::mma_sync(work_frag, q_frag, k_frag, work_frag);
+        // ----- FIN DE LA SECTION QK^T -----
+
+        // Le reste du code (softmax, etc.) commence ici.
         for(int i = 0; i < 8; i++) {
             work_frag.x[i] *= 1.0f / sqrtf((float)d_model);
         }
@@ -185,29 +208,31 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
         work_frag.x[5] = temp_f;
 
         for(int i = 0; i < 4; ++i) {
-            O_accum[i] = O_accum[i] * (old_sum_A_i / sum_A_i) * expf(max_A_i - fmax(max_A_i, max_A)) + work_frag.x[i] * (sum_A / sum_A_i);
+            s_O_accum[threadIdx.x][i] = s_O_accum[threadIdx.x][i] * (old_sum_A_i / sum_A_i) * expf(max_A_i - fmax(max_A_i, max_A)) + work_frag.x[i] * (sum_A / sum_A_i);
         }
 
         for(int i = 4; i < 8; ++i) {
-            O_accum[i] = O_accum[i] * (old_sum_B_i / sum_B_i) * expf(max_B_i - fmax(max_B_i, max_B)) + work_frag.x[i] * (sum_B / sum_B_i);
+            s_O_accum[threadIdx.x][i] = s_O_accum[threadIdx.x][i] * (old_sum_B_i / sum_B_i) * expf(max_B_i - fmax(max_B_i, max_B)) + work_frag.x[i] * (sum_B / sum_B_i);
         }
 
         max_A_i = fmax(max_A_i, max_A);
         max_B_i = fmax(max_B_i, max_B);
+
+        __syncthreads();
     }
 
-    float temp_f = O_accum[2];
-    O_accum[2] = O_accum[4];
-    O_accum[4] = temp_f;
+    float temp_f = s_O_accum[threadIdx.x][2];
+    s_O_accum[threadIdx.x][2] = s_O_accum[threadIdx.x][4];
+    s_O_accum[threadIdx.x][4] = temp_f;
 
-    temp_f = O_accum[3];
-    O_accum[3] = O_accum[5];
-    O_accum[5] = temp_f;
+    temp_f = s_O_accum[threadIdx.x][3];
+    s_O_accum[threadIdx.x][3] = s_O_accum[threadIdx.x][5];
+    s_O_accum[threadIdx.x][5] = temp_f;
 
     // Écriture avec les formules de mapping inverse
     for(int i = 0; i < 8; i++) {
 
-        out[(blockIdx.y * 16 + (threadIdx.x / 4) + (((i >> 1) & 1) * 8)) * d_model + blockIdx.x * 16 + ((threadIdx.x % 4) * 2) + (i % 2) + (((i >> 2) & 1) * 8)] = __float2bfloat16(O_accum[i]);
+        out[(blockIdx.y * 16 + (threadIdx.x / 4) + (((i >> 1) & 1) * 8)) * d_model + blockIdx.x * 16 + ((threadIdx.x % 4) * 2) + (i % 2) + (((i >> 2) & 1) * 8)] = __float2bfloat16(s_O_accum[threadIdx.x][i]);
     }
 }
 
@@ -344,7 +369,7 @@ int main() {
         sum_squared_error += diff * diff;
         
         // Compte les erreurs > seuil
-        if(diff > 1e-2) error_count++;
+        if(diff > 1e-3) error_count++;
     }
 
     float mean_error = sum_error / (seq_len * d_model);
@@ -354,7 +379,7 @@ int main() {
     printf("Max absolute error: %e\n", max_error);
     printf("Mean absolute error: %e\n", mean_error);
     printf("RMS error: %e\n", rms_error);
-    printf("Values with error > 1e-2: %d / %d (%.2f%%)\n", 
+    printf("Values with error > 1e-3: %d / %d (%.2f%%)\n", 
         error_count, seq_len * d_model, 
         100.0f * error_count / (seq_len * d_model));
 
